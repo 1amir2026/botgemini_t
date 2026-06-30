@@ -38,7 +38,11 @@ if ($text == $text_lang[$user_lang]['btn_gemini']) {
 if ($user['step'] == 'gemini_chat') {
     
     // کلید API گوگل (توصیه می‌شود در صورت افشا شدن حتما تعویض شود)
-    $gemini_api_key = 'AQ.Ab8RN6Js8j59gF57v2AQLoW6JHULq1zGrrJwgYKaVeHfi9S7Yg'; 
+    $gemini_api_key = getenv('GEMINI_API_KEY');
+    
+    if (!$gemini_api_key) {
+        die('GEMINI_API_KEY not found in Railway Variables');
+    }
     
     // لیست مدل‌ها به ترتیب اولویت برای سیستم Fallback
     $models = [
