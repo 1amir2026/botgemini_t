@@ -1,9 +1,9 @@
 <?php
 // تنظیمات اتصال به دیتابیس (PDO)
-$db_host = 'localhost';
-$db_name = 'نام_دیتابیس_شما';
-$db_user = 'نام_کاربری_دیتابیس';
-$db_pass = 'رمز_عبور_دیتابیس';
+$db_host = 'mysql.railway.internal';
+$db_name = 'railway';
+$db_user = 'root';
+$db_pass = 'REjgNgimvyaVGhsHgAdfJMIBfZQpcoEi';
 
 try {
     $db = new PDO("mysql:host=$db_host;dbname=$db_name;charset=utf8mb4", $db_user, $db_pass);
@@ -13,8 +13,8 @@ try {
 }
 
 // تنظیمات تلگرام
-$token = 'توکن_ربات_تلگرام_شما'; 
-$admin_id = 123456789; // آیدی عددی تلگرام خودتان
+$token = '8850924162:AAHjZ0mBHRbFMJqyDJCW5KGiLU20Vbotkwk'; 
+$admin_id = 6586028596; // آیدی عددی تلگرام خودتان
 // $channel_username = '@YourChannel'; // آیدی کانال قفل اجباری (با @)
 
 // متون چندزبانه ربات
