@@ -9,15 +9,143 @@ $callback_query = $update->callback_query ?? null;
 
 if ($message) {
     $from_id = $message->from->id;
-    $text = $message->text ?? '';
+    $text = $message->text ?? ($message->caption ?? '');
     $username = $message->from->username ?? null;
     $chat_id = $message->chat->id;
     $message_id = $message->message_id;
+    $chat_type = $message->chat->type ?? 'private';
 } elseif ($callback_query) {
     $from_id = $callback_query->from->id;
     $data = $callback_query->data;
     $chat_id = $callback_query->message->chat->id;
     $message_id = $callback_query->message->message_id;
+    $chat_type = $callback_query->message->chat->type ?? 'private';
+}
+
+// --------------------------------------------------------
+// اطلاعات سازنده ربات (برای پاسخ‌های هوشمند و معرفی)
+// --------------------------------------------------------
+define('BOT_CREATOR_TEXT', "🤖 این ربات توسط تیم @BloxyDesign و @ItzAmiRxD طراحی و ساخته شده است.");
+define('BOT_BEST_CHANNEL_TEXT', "🏆 بدون شک بهترین کانال تامنیل، ماینکرافت، دیزاین و طراحی، کانال @BloxyDesign هست! کیفیت کارها، خلاقیت و سرعت تحویلشون واقعاً عالیه. حتما یه سر بزن 🔥");
+
+// --------------------------------------------------------
+// تابع کمکی: تشخیص و پاسخ به سوالات/کلیدواژه‌های ثابت
+// (سازنده ربات، بهترین کانال، ایستر اگ «پیکسیا»)
+// خروجی: true یعنی پیام پردازش و پاسخ داده شد (دیگر نیازی به ادامه پردازش نیست)
+// --------------------------------------------------------
+function bot_handle_special_triggers($text, $chat_id, $message_id) {
+    if (trim((string)$text) === '') return false;
+    $lower = mb_strtolower($text);
+
+    // ایستر اگ: هر جا کلمه «پیکسیا» در پیام باشد
+    if (mb_strpos($text, 'پیکسیا') !== false || mb_strpos($lower, 'pixia') !== false) {
+        bot('sendMessage', [
+            'chat_id' => $chat_id,
+            'reply_to_message_id' => $message_id,
+            'text' => "پیکسیا کیه؟ نشناختم 🤔"
+        ]);
+        return true;
+    }
+
+    // سوال درباره سازنده ربات
+    if (preg_match('/(کی|چه ?کسی|چه تیمی).{0,15}(ساخت|طراحی کرد|درست کرد|توسعه داد)/u', $text)
+        || preg_match('/سازنده.{0,10}(ربات|بات)/u', $text)
+        || preg_match('/(ربات|بات).{0,10}(رو|را).{0,10}(کی|چه ?کسی).{0,10}ساخت/u', $text)
+        || mb_strpos($lower, 'who made you') !== false
+        || mb_strpos($lower, 'who created you') !== false
+        || mb_strpos($lower, 'who developed you') !== false) {
+        bot('sendMessage', [
+            'chat_id' => $chat_id,
+            'reply_to_message_id' => $message_id,
+            'text' => BOT_CREATOR_TEXT
+        ]);
+        return true;
+    }
+
+    // سوال درباره بهترین کانال تامنیل/ماینکرافت/دیزاین
+    if (preg_match('/بهترین.{0,15}(کانال|چنل).{0,25}(تامنیل|ماینکرافت|دیزاین|طراحی)/u', $text)
+        || preg_match('/(تامنیل|ماینکرافت|دیزاین|طراحی).{0,25}بهترین.{0,15}(کانال|چنل)/u', $text)) {
+        bot('sendMessage', [
+            'chat_id' => $chat_id,
+            'reply_to_message_id' => $message_id,
+            'text' => BOT_BEST_CHANNEL_TEXT
+        ]);
+        return true;
+    }
+
+    return false;
+}
+
+// این تریگرها روی هر پیام متنی (در خصوصی یا گروه) قبل از هر پردازش دیگری بررسی می‌شوند
+if ($message && $text) {
+    if (bot_handle_special_triggers($text, $chat_id, $message_id)) {
+        exit;
+    }
+}
+
+// --------------------------------------------------------
+// تابع کمکی: پاسخ هوشمند Bloxy در گروه‌ها
+// فعال می‌شود وقتی: نام Bloxy/بلاکسی صدا زده شود، یا کاربر روی پیام خودِ ربات ریپلای کند.
+// متن پیامی که رویش ریپلای شده را هم به‌عنوان context به مدل می‌دهد.
+// --------------------------------------------------------
+function bot_group_ai_reply($message, $chat_id, $message_id, $user_lang) {
+    $gemini_api_key = getenv('GEMINI_API_KEY');
+    if (!$gemini_api_key) return;
+
+    $user_text = $message->text ?? ($message->caption ?? '');
+    if (trim($user_text) === '') return;
+
+    // حذف نام صدا زدن ربات از ابتدای/میان پیام برای تمیزتر شدن سوال
+    $clean_text = preg_replace('/\b(bloxy)\b/iu', '', $user_text);
+    $clean_text = preg_replace('/(بلاکسی|بلوکسی)/u', '', $clean_text);
+    $clean_text = trim($clean_text, " \t\n\r\0\x0B,،:؛-");
+    if ($clean_text === '') $clean_text = $user_text;
+
+    $context_prefix = '';
+    if (isset($message->reply_to_message)) {
+        $replied = $message->reply_to_message;
+        $replied_text = $replied->text ?? ($replied->caption ?? '');
+        if (trim($replied_text) !== '') {
+            $context_prefix = "پیامی که کاربر روی آن ریپلای کرده است:\n\"" . $replied_text . "\"\n\n";
+        }
+    }
+
+    $prompt = $context_prefix .
+        "پیام جدید کاربر در گروه (خطاب به تو):\n\"" . $clean_text . "\"\n\n" .
+        "تو یک دستیار هوش مصنوعی به نام Bloxy هستی که توسط تیم @BloxyDesign و @ItzAmiRxD ساخته شده‌ای و داخل یک گروه تلگرامی فعالی. " .
+        "اگر کسی پرسید کی ساختت، بگو تیم @BloxyDesign و @ItzAmiRxD. " .
+        "اگر کسی پرسید بهترین کانال تامنیل/ماینکرافت/دیزاین چیه، بگو @BloxyDesign. " .
+        "کوتاه، دوستانه، طبیعی و مثل یک عضو باهوش گروه جواب بده (نه طولانی و رسمی)، با توجه به متنی که رویش ریپلای شده اگر وجود داشت. " .
+        "زبان پاسخ را با زبان پیام کاربر هماهنگ کن.";
+
+    $payload = ["contents" => [["parts" => [["text" => $prompt]]]]];
+    $api_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" . $gemini_api_key;
+
+    $ch = curl_init($api_url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+    $response = curl_exec($ch);
+    curl_close($ch);
+
+    $result = json_decode($response, true);
+    $reply_text = $result['candidates'][0]['content']['parts'][0]['text'] ?? null;
+
+    if ($reply_text) {
+        bot('sendMessage', [
+            'chat_id' => $chat_id,
+            'reply_to_message_id' => $message_id,
+            'text' => $reply_text
+        ]);
+    } else {
+        bot('sendMessage', [
+            'chat_id' => $chat_id,
+            'reply_to_message_id' => $message_id,
+            'text' => "❌ الان نتونستم جواب بدم، یه لحظه دیگه دوباره امتحان کن."
+        ]);
+    }
 }
 
 // --------------------------------------------------------
@@ -268,6 +396,26 @@ if ($callback_query && $data == 'verify_membership') {
         ]);
     }
     exit;
+}
+
+// --------------------------------------------------------
+// واکنش به نام «Bloxy / بلاکسی» داخل گروه‌ها (برای استفاده گروهی ربات)
+// همچنین وقتی کاربر روی پیام خود ربات ریپلای می‌کند، پاسخ هوشمند می‌دهد
+// و متن پیامی که رویش ریپلای شده را هم به‌عنوان زمینه به مدل می‌دهد.
+// --------------------------------------------------------
+if ($message && $chat_type !== 'private' && trim((string)$text) !== '') {
+    $lower_text_g = mb_strtolower($text);
+    $bloxy_called = (mb_strpos($lower_text_g, 'bloxy') !== false)
+        || (mb_strpos($text, 'بلاکسی') !== false)
+        || (mb_strpos($text, 'بلوکسی') !== false);
+
+    $is_reply_to_bot = isset($message->reply_to_message->from->is_bot)
+        && $message->reply_to_message->from->is_bot === true;
+
+    if ($bloxy_called || $is_reply_to_bot) {
+        bot_group_ai_reply($message, $chat_id, $message_id, $user_lang);
+        exit;
+    }
 }
 
 // --------------------------------------------------------
