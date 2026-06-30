@@ -99,6 +99,39 @@ function gemini_to_telegram_html($text) {
     return $text;
 }
 
+// =================================================================
+// بخش ۲.۶: ارسال عکس مرتبط از گوگل برای کمک به یادگیری بهتر (اختیاری)
+// نیاز به دو متغیر محیطی دارد: GOOGLE_CSE_API_KEY و GOOGLE_CSE_CX
+// (از Google Programmable Search Engine با قابلیت Image Search ساخته می‌شود)
+// اگر این متغیرها تنظیم نشده باشند، این تابع بدون خطا کاری انجام نمی‌دهد.
+// =================================================================
+function gemini_maybe_send_related_image($chat_id, $query) {
+    $cse_key = getenv('GOOGLE_CSE_API_KEY');
+    $cse_cx  = getenv('GOOGLE_CSE_CX');
+    if (!$cse_key || !$cse_cx || trim((string)$query) === '') return;
+
+    $url = "https://www.googleapis.com/customsearch/v1?key=" . urlencode($cse_key) .
+           "&cx=" . urlencode($cse_cx) .
+           "&searchType=image&num=1&safe=active&q=" . urlencode($query);
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 12);
+    $resp = curl_exec($ch);
+    curl_close($ch);
+    if (!$resp) return;
+
+    $data = json_decode($resp, true);
+    $image_url = $data['items'][0]['link'] ?? null;
+    if (!$image_url) return;
+
+    bot('sendPhoto', [
+        'chat_id' => $chat_id,
+        'photo' => $image_url,
+        'caption' => "🖼 یک تصویر مرتبط برای درک بهتر موضوع"
+    ]);
+}
+
 // تابع کمکی: ارسال امن پیام با parse_mode HTML و Fallback به متن ساده در صورت خطا
 function gemini_safe_send($chat_id, $raw_text, $reply_markup = null) {
     $formatted = gemini_to_telegram_html($raw_text);
@@ -672,6 +705,11 @@ if ($user['step'] == 'gemini_chat') {
     if ($success) {
         // ارسال هوشمند: اگر کد سنگین بود به‌صورت فایل، در غیر اینصورت پیام فرمت‌شده با HTML
         gemini_deliver_reply($chat_id, $reply_text, $from_id);
+
+        // برای سوالات آموزشی معمولی (نه کد/لاگ)، یک تصویر مرتبط هم برای درک بهتر می‌فرستیم
+        if (!$is_code_task && !$uploaded_file_content && !empty($text)) {
+            gemini_maybe_send_related_image($chat_id, $text);
+        }
     } else {
         $error_details = "❌ سرورهای گوگل پاسخ موفق ندادند. جزئیات خطا برای دیباگ:\n\n";
 
