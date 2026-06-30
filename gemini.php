@@ -2,92 +2,96 @@
 // فایل کامل و یکپارچه gemini.php - سیستم حل سوالات با جمنای + تولید تصویر + دستیار برنامه‌نویسی حرفه‌ای + پشتیبان خودکار
 
 // =================================================================
-// بخش ۱: فرمت‌کننده پیشرفته متن گوگل -> تلگرام (MarkdownV2)
+// بخش ۱: فرمت‌کننده متن گوگل -> HTML تلگرام (parse_mode = HTML)
 // =================================================================
-// تلگرام Markdown قدیمی خیلی شکننده است (با هر کاراکتر اضافه کل پیام plain می‌افتد).
-// به همین دلیل از MarkdownV2 با escape کامل استفاده می‌کنیم تا:
-//  - **بولد** همیشه درست نمایش داده شود
-//  - ``` کدها همیشه به صورت بلوک کد (با امکان کپی در تلگرام) نمایش داده شوند
-//  - --- به یک خط جداکننده واقعی تبدیل شود
+// چرا HTML به‌جای Markdown؟ چون پارسر Markdown/MarkdownV2 تلگرام به شدت شکننده است:
+// هر کاراکتر خاص اسکیپ‌نشده (مثل کاراکترهای فارسی، پرانتز و...) باعث rejected شدن کل پیام می‌شود
+// و پیام بدون parse_mode (متن خام) ارسال می‌شود - دقیقا همان چیزی که باعث می‌شد بولد و --- کار نکنند.
+// پارسر HTML تلگرام خیلی مقاوم‌تر است: فقط باید &, <, > را escape کنیم و تگ‌های ساده <b>, <code>, <pre> بگذاریم.
 
-// escape تمام کاراکترهای خاص MarkdownV2 طبق مستندات رسمی تلگرام
-function gemini_escape_md2($text) {
-    $special = ['\\', '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
-    foreach ($special as $ch) {
-        $text = str_replace($ch, '\\' . $ch, $text);
-    }
-    return $text;
-}
-
-// escape مخصوص داخل بلوک کد (``` ... ```) - فقط \ و ` باید اسکیپ شوند
-function gemini_escape_md2_code($text) {
-    $text = str_replace('\\', '\\\\', $text);
-    $text = str_replace('`', '\\`', $text);
+// escape کاراکترهای خاص HTML (باید همیشه روی متن خامِ غیر تگ اعمال شود)
+function gemini_escape_html($text) {
+    $text = str_replace('&', '&amp;', $text);
+    $text = str_replace('<', '&lt;', $text);
+    $text = str_replace('>', '&gt;', $text);
     return $text;
 }
 
 /**
- * تبدیل خروجی متنی Gemini (که از Markdown معمولی استفاده می‌کند) به MarkdownV2 معتبر تلگرام.
+ * تبدیل خروجی متنی Gemini (که از Markdown معمولی استفاده می‌کند) به HTML معتبر تلگرام.
  * پشتیبانی می‌کند از:
- *   ```lang \n code \n ```   => بلوک کد واقعی (قابل کپی با یک لمس در تلگرام)
- *   `inline code`            => کد درون‌خطی
- *   **bold**                 => بولد
- *   *italic* یا _italic_     => ایتالیک
- *   ---  یا ___ یا ***       => خط جداکننده افقی
+ *   ```lang \n code \n ```   => <pre><code class="language-lang">...</code></pre>  (بلوک کد، قابل کپی با یک لمس)
+ *   `inline code`            => <code>...</code>
+ *   **bold**                 => <b>...</b>
+ *   *italic* یا _italic_     => <i>...</i>
+ *   ---  یا ___ یا ***  (در یک خط جدا) => خط جداکننده افقی واقعی
  */
-function gemini_to_telegram_markdown($text) {
+function gemini_to_telegram_html($text) {
     // یکسان‌سازی line breakها
     $text = str_replace("\r\n", "\n", $text);
 
-    // ابتدا بلوک‌های کد ```...``` را استخراج می‌کنیم تا escape عمومی به آن‌ها آسیب نزند
+    // ۱) استخراج بلوک‌های کد ```...``` قبل از هر کار دیگری، تا محتوای داخلشان escape جداگانه و امن بگیرد
     $code_blocks = [];
-    $placeholder_index = 0;
-    $text = preg_replace_callback('/```([a-zA-Z0-9_+\-]*)\n?([\s\S]*?)```/', function ($m) use (&$code_blocks, &$placeholder_index) {
+    $cb_index = 0;
+    $text = preg_replace_callback('/```([a-zA-Z0-9_+\-]*)\n?([\s\S]*?)```/', function ($m) use (&$code_blocks, &$cb_index) {
         $lang = trim($m[1]);
         $code = rtrim($m[2], "\n");
-        $placeholder = "\x01CODEBLOCK" . $placeholder_index . "\x01";
-        $escaped_code = gemini_escape_md2_code($code);
-        $lang_part = $lang !== '' ? gemini_escape_md2($lang) : '';
-        $code_blocks[$placeholder] = "```" . $lang_part . "\n" . $escaped_code . "\n```";
-        $placeholder_index++;
+        $escaped_code = gemini_escape_html($code);
+        $lang_attr = $lang !== '' ? ' class="language-' . preg_replace('/[^a-zA-Z0-9_\-]/', '', $lang) . '"' : '';
+        $placeholder = "\x01CB" . $cb_index . "\x01";
+        $code_blocks[$placeholder] = "<pre><code{$lang_attr}>{$escaped_code}</code></pre>";
+        $cb_index++;
         return $placeholder;
     }, $text);
 
-    // استخراج کدهای درون‌خطی `code`
+    // ۲) استخراج کدهای درون‌خطی `code`
     $inline_codes = [];
-    $inline_index = 0;
-    $text = preg_replace_callback('/`([^`\n]+)`/', function ($m) use (&$inline_codes, &$inline_index) {
-        $placeholder = "\x02INLINECODE" . $inline_index . "\x02";
-        $inline_codes[$placeholder] = '`' . gemini_escape_md2_code($m[1]) . '`';
-        $inline_index++;
+    $ic_index = 0;
+    $text = preg_replace_callback('/`([^`\n]+)`/', function ($m) use (&$inline_codes, &$ic_index) {
+        $placeholder = "\x02IC" . $ic_index . "\x02";
+        $inline_codes[$placeholder] = '<code>' . gemini_escape_html($m[1]) . '</code>';
+        $ic_index++;
         return $placeholder;
     }, $text);
 
-    // تبدیل خطوط جداکننده (---, ___, ***) که در یک خط جدا آمده‌اند به یک خط افقی واقعی
+    // ۳) تبدیل خطوط جداکننده (---، ___، ***) که به‌تنهایی در یک خط آمده‌اند، به یک خط افقی واقعی
+    //    (HTML تلگرام تگ <hr> ندارد، پس از یک خط نماد استفاده می‌کنیم)
     $text = preg_replace('/^[ \t]*([-_*])\1{2,}[ \t]*$/m', "\x03HR\x03", $text);
 
-    // بولد: **text** -> *text* (سینتکس بولد تلگرام در MarkdownV2)
+    // ۴) بولد: **text** -> نشانگر موقت (قبل از escape کلی متن انجام می‌شود تا ** خودش escape نشود)
     $text = preg_replace('/\*\*(.+?)\*\*/s', "\x04B\x04" . '$1' . "\x04B\x04", $text);
 
-    // ایتالیک با زیرخط: _text_  (یک کاراکتر زیرخط، نه بولد) -> نگه می‌داریم برای بعد از escape
+    // ۵) ایتالیک تک‌ستاره یا زیرخط: *text* یا _text_ (بعد از حذف بولد، باقیمانده تک‌ستاره‌ها ایتالیک محسوب می‌شوند)
+    $text = preg_replace('/(?<!\*)\*([^*\n]+)\*(?!\*)/', "\x05I\x05" . '$1' . "\x05I\x05", $text);
     $text = preg_replace('/(?<!_)_([^_\n]+)_(?!_)/', "\x05I\x05" . '$1' . "\x05I\x05", $text);
 
-    // حالا کل متن باقی‌مانده را escape کامل می‌کنیم
-    $text = gemini_escape_md2($text);
+    // ۶) حالا کل متن باقیمانده (متن خام معمولی) را escape می‌کنیم تا &,<,> مشکل‌ساز نشوند
+    $text = gemini_escape_html($text);
 
-    // برگرداندن نشانگرهای بولد/ایتالیک به سینتکس واقعی MarkdownV2
-    $text = str_replace("\x04B\x04", '*', $text);
-    $text = str_replace("\x05I\x05", '_', $text);
+    // ۷) برگرداندن نشانگرهای بولد/ایتالیک به تگ واقعی HTML
+    $text = str_replace("\x04B\x04", '~~~B~~~', $text); // جداسازی موقت برای جلوگیری از تداخل با replace بعدی
+    $parts = explode('~~~B~~~', $text);
+    $text = '';
+    foreach ($parts as $i => $p) {
+        $text .= ($i % 2 === 1) ? "<b>{$p}</b>" : $p;
+    }
 
-    // برگرداندن خط جداکننده (یک خط زیرخط‌دار ساده که در تلگرام به شکل یک ردیف نمایش داده می‌شود)
+    $text = str_replace("\x05I\x05", '~~~I~~~', $text);
+    $parts = explode('~~~I~~~', $text);
+    $text = '';
+    foreach ($parts as $i => $p) {
+        $text .= ($i % 2 === 1) ? "<i>{$p}</i>" : $p;
+    }
+
+    // ۸) برگرداندن خط جداکننده
     $text = str_replace("\x03HR\x03", str_repeat('▬', 18), $text);
 
-    // برگرداندن کدهای درون‌خطی
+    // ۹) برگرداندن کدهای درون‌خطی
     foreach ($inline_codes as $ph => $val) {
         $text = str_replace($ph, $val, $text);
     }
 
-    // برگرداندن بلوک‌های کد
+    // ۱۰) برگرداندن بلوک‌های کد
     foreach ($code_blocks as $ph => $val) {
         $text = str_replace($ph, $val, $text);
     }
@@ -95,20 +99,20 @@ function gemini_to_telegram_markdown($text) {
     return $text;
 }
 
-// تابع کمکی: ارسال امن پیام با parse_mode MarkdownV2 و Fallback به متن ساده در صورت خطا
+// تابع کمکی: ارسال امن پیام با parse_mode HTML و Fallback به متن ساده در صورت خطا
 function gemini_safe_send($chat_id, $raw_text, $reply_markup = null) {
-    $formatted = gemini_to_telegram_markdown($raw_text);
+    $formatted = gemini_to_telegram_html($raw_text);
     $params = [
         'chat_id' => $chat_id,
         'text' => $formatted,
-        'parse_mode' => 'MarkdownV2'
+        'parse_mode' => 'HTML'
     ];
     if ($reply_markup) $params['reply_markup'] = $reply_markup;
 
     $resp = bot('sendMessage', $params);
     if (!($resp->ok ?? false)) {
-        // اگر فرمت‌بندی به هر دلیلی رد شد، بدون parse_mode (متن خام) دوباره ارسال کن
-        error_log("[GEMINI MD2 FALLBACK] " . json_encode($resp));
+        // اگر فرمت‌بندی به هر دلیلی رد شد (مثلا تگ ناقص)، بدون parse_mode (متن خام) دوباره ارسال کن
+        error_log("[GEMINI HTML FALLBACK] " . json_encode($resp));
         $fallback_params = ['chat_id' => $chat_id, 'text' => $raw_text];
         if ($reply_markup) $fallback_params['reply_markup'] = $reply_markup;
         $resp = bot('sendMessage', $fallback_params);
@@ -167,7 +171,7 @@ function gemini_guess_file_extension($lang, $code) {
 /**
  * متن نهایی Gemini را بررسی می‌کند:
  *  - اگر بلوک کد طولانی/سنگین داشت (یا کل پیام خیلی بلند بود) آن را به‌صورت فایل سند ارسال می‌کند
- *  - در غیر این صورت با فرمت MarkdownV2 (کدباکس، بولد، خط جداکننده) به صورت پیام ارسال می‌کند
+ *  - در غیر این صورت با فرمت HTML (کدباکس، بولد، خط جداکننده) به صورت پیام ارسال می‌کند
  */
 function gemini_deliver_reply($chat_id, $reply_text, $from_id) {
     // پیدا کردن بلوک‌های کد داخل پاسخ
@@ -176,6 +180,7 @@ function gemini_deliver_reply($chat_id, $reply_text, $from_id) {
     $send_as_file = false;
     $file_lang = '';
     $file_code = '';
+    $biggest_match_full = '';
 
     if (!empty($matches)) {
         // بزرگ‌ترین بلوک کد را پیدا کن
@@ -185,6 +190,7 @@ function gemini_deliver_reply($chat_id, $reply_text, $from_id) {
             if (mb_strlen($m[2]) > mb_strlen($longest)) {
                 $longest = $m[2];
                 $longest_lang = $m[1];
+                $biggest_match_full = $m[0];
             }
         }
         $code_lines = substr_count($longest, "\n") + 1;
@@ -202,12 +208,9 @@ function gemini_deliver_reply($chat_id, $reply_text, $from_id) {
         file_put_contents($tmp_path, $file_code);
 
         // متنی که خارج از بلوک کد اصلی نوشته شده را به‌عنوان توضیح/کپشن می‌فرستیم
-        $explanation = trim(str_replace($matches[0][0] ?? '', '', $reply_text));
+        $explanation = trim(str_replace($biggest_match_full, '', $reply_text));
         if ($explanation === '') {
             $explanation = "📄 کد/فایل شما آماده شد. می‌توانید آن را دانلود کنید.";
-        }
-        if (mb_strlen($explanation) > 900) {
-            $explanation = mb_substr($explanation, 0, 900) . "...";
         }
 
         global $token;
@@ -264,8 +267,8 @@ if ($text == $text_lang[$user_lang]['btn_gemini']) {
 
     bot('sendMessage', [
         'chat_id' => $chat_id,
-        'text' => gemini_to_telegram_markdown($msg),
-        'parse_mode' => 'MarkdownV2',
+        'text' => gemini_to_telegram_html($msg),
+        'parse_mode' => 'HTML',
         'reply_markup' => json_encode(['keyboard' => [[$back_btn]], 'resize_keyboard' => true])
     ]);
     exit;
@@ -412,8 +415,8 @@ if ($user['step'] == 'gemini_chat') {
             $send_url = "https://api.telegram.org/bot" . $token . "/sendPhoto";
             $post_fields = [
                 'chat_id' => $chat_id,
-                'caption' => gemini_to_telegram_markdown($caption_text),
-                'parse_mode' => 'MarkdownV2',
+                'caption' => gemini_to_telegram_html($caption_text),
+                'parse_mode' => 'HTML',
                 'photo' => new CURLFile($tmp_path, 'image/png', 'image.png')
             ];
 
@@ -603,7 +606,7 @@ if ($user['step'] == 'gemini_chat') {
     if ($wait_msg_id) bot('deleteMessage', ['chat_id' => $chat_id, 'message_id' => $wait_msg_id]);
 
     if ($success) {
-        // ارسال هوشمند: اگر کد سنگین بود به‌صورت فایل، در غیر اینصورت پیام فرمت‌شده با MarkdownV2
+        // ارسال هوشمند: اگر کد سنگین بود به‌صورت فایل، در غیر اینصورت پیام فرمت‌شده با HTML
         gemini_deliver_reply($chat_id, $reply_text, $from_id);
     } else {
         $error_details = "❌ سرورهای گوگل پاسخ موفق ندادند. جزئیات خطا برای دیباگ:\n\n";
