@@ -1,0 +1,25 @@
+-- ساخت جدول یوزر ها
+CREATE TABLE IF NOT EXISTS `users` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `user_id` BIGINT NOT NULL UNIQUE,
+  `username` VARCHAR(255) DEFAULT NULL,
+  `lang` VARCHAR(10) DEFAULT NULL,
+  `step` VARCHAR(50) DEFAULT 'start',
+  `balance` INT DEFAULT 0
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ساخت جدول کانال‌ها
+CREATE TABLE IF NOT EXISTS `channels` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `channel_id` VARCHAR(100) NOT NULL,
+  `channel_url` VARCHAR(255) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ساخت جدول تنظیمات ربات
+CREATE TABLE IF NOT EXISTS `settings` (
+  `setting_key` VARCHAR(50) PRIMARY KEY,
+  `setting_value` VARCHAR(255) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- روشن کردن قفل کانال به صورت پیش‌فرض
+INSERT IGNORE INTO `settings` (`setting_key`, `setting_value`) VALUES ('lock_status', 'on');
