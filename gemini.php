@@ -1,35 +1,240 @@
 <?php
-// فایل کامل و یکپارچه gemini.php - سیستم حل سوالات با جمنای + تولید تصویر + پشتیبان خودکار
+// فایل کامل و یکپارچه gemini.php - سیستم حل سوالات با جمنای + تولید تصویر + دستیار برنامه‌نویسی حرفه‌ای + پشتیبان خودکار
 
-// تابع کمکی: تبدیل **بولد** سبک مارک‌داون معمولی به فرمت بولد تلگرام (Markdown legacy => *bold*)
-// و خنثی‌سازی کاراکترهای خاصی که می‌توانند parse_mode را خراب کنند.
-function gemini_to_telegram_markdown($text) {
-    // ابتدا **بولد** -> *بولد* (تلگرام Markdown قدیمی فقط با یک ستاره بولد می‌کند)
-    $text = preg_replace('/\*\*(.+?)\*\*/s', '*$1*', $text);
-    // حذف ستاره‌های یتیمی که جفت ندارند تا تلگرام خطای entity ندهد
-    $stars = substr_count($text, '*');
-    if ($stars % 2 !== 0) {
-        $text = str_replace('*', '', $text);
+// =================================================================
+// بخش ۱: فرمت‌کننده پیشرفته متن گوگل -> تلگرام (MarkdownV2)
+// =================================================================
+// تلگرام Markdown قدیمی خیلی شکننده است (با هر کاراکتر اضافه کل پیام plain می‌افتد).
+// به همین دلیل از MarkdownV2 با escape کامل استفاده می‌کنیم تا:
+//  - **بولد** همیشه درست نمایش داده شود
+//  - ``` کدها همیشه به صورت بلوک کد (با امکان کپی در تلگرام) نمایش داده شوند
+//  - --- به یک خط جداکننده واقعی تبدیل شود
+
+// escape تمام کاراکترهای خاص MarkdownV2 طبق مستندات رسمی تلگرام
+function gemini_escape_md2($text) {
+    $special = ['\\', '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'];
+    foreach ($special as $ch) {
+        $text = str_replace($ch, '\\' . $ch, $text);
     }
     return $text;
 }
 
-// تابع کمکی: ارسال امن پیام با parse_mode Markdown و Fallback به متن ساده در صورت خطا
-function gemini_safe_send($chat_id, $text) {
-    $formatted = gemini_to_telegram_markdown($text);
-    $resp = bot('sendMessage', [
+// escape مخصوص داخل بلوک کد (``` ... ```) - فقط \ و ` باید اسکیپ شوند
+function gemini_escape_md2_code($text) {
+    $text = str_replace('\\', '\\\\', $text);
+    $text = str_replace('`', '\\`', $text);
+    return $text;
+}
+
+/**
+ * تبدیل خروجی متنی Gemini (که از Markdown معمولی استفاده می‌کند) به MarkdownV2 معتبر تلگرام.
+ * پشتیبانی می‌کند از:
+ *   ```lang \n code \n ```   => بلوک کد واقعی (قابل کپی با یک لمس در تلگرام)
+ *   `inline code`            => کد درون‌خطی
+ *   **bold**                 => بولد
+ *   *italic* یا _italic_     => ایتالیک
+ *   ---  یا ___ یا ***       => خط جداکننده افقی
+ */
+function gemini_to_telegram_markdown($text) {
+    // یکسان‌سازی line breakها
+    $text = str_replace("\r\n", "\n", $text);
+
+    // ابتدا بلوک‌های کد ```...``` را استخراج می‌کنیم تا escape عمومی به آن‌ها آسیب نزند
+    $code_blocks = [];
+    $placeholder_index = 0;
+    $text = preg_replace_callback('/```([a-zA-Z0-9_+\-]*)\n?([\s\S]*?)```/', function ($m) use (&$code_blocks, &$placeholder_index) {
+        $lang = trim($m[1]);
+        $code = rtrim($m[2], "\n");
+        $placeholder = "\x01CODEBLOCK" . $placeholder_index . "\x01";
+        $escaped_code = gemini_escape_md2_code($code);
+        $lang_part = $lang !== '' ? gemini_escape_md2($lang) : '';
+        $code_blocks[$placeholder] = "```" . $lang_part . "\n" . $escaped_code . "\n```";
+        $placeholder_index++;
+        return $placeholder;
+    }, $text);
+
+    // استخراج کدهای درون‌خطی `code`
+    $inline_codes = [];
+    $inline_index = 0;
+    $text = preg_replace_callback('/`([^`\n]+)`/', function ($m) use (&$inline_codes, &$inline_index) {
+        $placeholder = "\x02INLINECODE" . $inline_index . "\x02";
+        $inline_codes[$placeholder] = '`' . gemini_escape_md2_code($m[1]) . '`';
+        $inline_index++;
+        return $placeholder;
+    }, $text);
+
+    // تبدیل خطوط جداکننده (---, ___, ***) که در یک خط جدا آمده‌اند به یک خط افقی واقعی
+    $text = preg_replace('/^[ \t]*([-_*])\1{2,}[ \t]*$/m', "\x03HR\x03", $text);
+
+    // بولد: **text** -> *text* (سینتکس بولد تلگرام در MarkdownV2)
+    $text = preg_replace('/\*\*(.+?)\*\*/s', "\x04B\x04" . '$1' . "\x04B\x04", $text);
+
+    // ایتالیک با زیرخط: _text_  (یک کاراکتر زیرخط، نه بولد) -> نگه می‌داریم برای بعد از escape
+    $text = preg_replace('/(?<!_)_([^_\n]+)_(?!_)/', "\x05I\x05" . '$1' . "\x05I\x05", $text);
+
+    // حالا کل متن باقی‌مانده را escape کامل می‌کنیم
+    $text = gemini_escape_md2($text);
+
+    // برگرداندن نشانگرهای بولد/ایتالیک به سینتکس واقعی MarkdownV2
+    $text = str_replace("\x04B\x04", '*', $text);
+    $text = str_replace("\x05I\x05", '_', $text);
+
+    // برگرداندن خط جداکننده (یک خط زیرخط‌دار ساده که در تلگرام به شکل یک ردیف نمایش داده می‌شود)
+    $text = str_replace("\x03HR\x03", str_repeat('▬', 18), $text);
+
+    // برگرداندن کدهای درون‌خطی
+    foreach ($inline_codes as $ph => $val) {
+        $text = str_replace($ph, $val, $text);
+    }
+
+    // برگرداندن بلوک‌های کد
+    foreach ($code_blocks as $ph => $val) {
+        $text = str_replace($ph, $val, $text);
+    }
+
+    return $text;
+}
+
+// تابع کمکی: ارسال امن پیام با parse_mode MarkdownV2 و Fallback به متن ساده در صورت خطا
+function gemini_safe_send($chat_id, $raw_text, $reply_markup = null) {
+    $formatted = gemini_to_telegram_markdown($raw_text);
+    $params = [
         'chat_id' => $chat_id,
         'text' => $formatted,
-        'parse_mode' => 'Markdown'
-    ]);
+        'parse_mode' => 'MarkdownV2'
+    ];
+    if ($reply_markup) $params['reply_markup'] = $reply_markup;
+
+    $resp = bot('sendMessage', $params);
     if (!($resp->ok ?? false)) {
-        // اگر بخاطر فرمت نادرست رد شد، بدون parse_mode دوباره ارسال کن
-        bot('sendMessage', [
-            'chat_id' => $chat_id,
-            'text' => $text
-        ]);
+        // اگر فرمت‌بندی به هر دلیلی رد شد، بدون parse_mode (متن خام) دوباره ارسال کن
+        error_log("[GEMINI MD2 FALLBACK] " . json_encode($resp));
+        $fallback_params = ['chat_id' => $chat_id, 'text' => $raw_text];
+        if ($reply_markup) $fallback_params['reply_markup'] = $reply_markup;
+        $resp = bot('sendMessage', $fallback_params);
     }
     return $resp;
+}
+
+// =================================================================
+// بخش ۲: تشخیص کد / فایل لاگ و ارسال هوشمند (پیام یا فایل سند)
+// =================================================================
+
+// آیا متن ورودی کاربر، یک تکه کد یا لاگ به نظر می‌رسد؟ (برای تنظیم پرامپت سیستم)
+function gemini_looks_like_code_or_log($text) {
+    if (preg_match('/```/', $text)) return true;
+    if (preg_match('/\b(def |class |import |function |public |private |#include|SELECT |Traceback|Exception|Error:|at [a-zA-Z0-9_.]+\(.*\)|\bnull\b|\bundefined\b)/i', $text)) return true;
+    // خطوط زیاد با تورفتگی/نشانه‌های کد
+    $lines = explode("\n", $text);
+    if (count($lines) > 6) {
+        $code_like = 0;
+        foreach ($lines as $l) {
+            if (preg_match('/^[\s]*[\{\}\[\]();]|^[\s]{2,}\S|=>|==|!=|::/', $l)) $code_like++;
+        }
+        if ($code_like > count($lines) * 0.3) return true;
+    }
+    return false;
+}
+
+// تشخیص پسوند مناسب فایل بر اساس نام زبان اعلام‌شده در fence یا محتوای کد
+function gemini_guess_file_extension($lang, $code) {
+    $lang = strtolower(trim($lang));
+    $map = [
+        'python' => 'py', 'py' => 'py',
+        'javascript' => 'js', 'js' => 'js', 'node' => 'js',
+        'typescript' => 'ts', 'ts' => 'ts',
+        'php' => 'php',
+        'java' => 'java',
+        'c' => 'c', 'cpp' => 'cpp', 'c++' => 'cpp',
+        'csharp' => 'cs', 'c#' => 'cs', 'cs' => 'cs',
+        'html' => 'html', 'css' => 'css',
+        'json' => 'json', 'yaml' => 'yaml', 'yml' => 'yml',
+        'bash' => 'sh', 'shell' => 'sh', 'sh' => 'sh',
+        'sql' => 'sql', 'go' => 'go', 'rust' => 'rs', 'kotlin' => 'kt',
+        'log' => 'log', 'text' => 'txt', 'txt' => 'txt',
+    ];
+    if (isset($map[$lang])) return $map[$lang];
+
+    // حدس بر اساس محتوا
+    if (preg_match('/^\s*<\?php/m', $code)) return 'php';
+    if (preg_match('/def\s+\w+\(.*\):|import\s+\w+/m', $code)) return 'py';
+    if (preg_match('/Traceback|Exception in thread|at\s+[\w.$]+\(.+\)|^\[\d{4}-\d{2}-\d{2}/m', $code)) return 'log';
+    if (preg_match('/function\s+\w+\s*\(|=>|const\s+\w+\s*=/m', $code)) return 'js';
+    if (preg_match('/^\s*\{[\s\S]*\}\s*$/', $code)) return 'json';
+    return 'txt';
+}
+
+/**
+ * متن نهایی Gemini را بررسی می‌کند:
+ *  - اگر بلوک کد طولانی/سنگین داشت (یا کل پیام خیلی بلند بود) آن را به‌صورت فایل سند ارسال می‌کند
+ *  - در غیر این صورت با فرمت MarkdownV2 (کدباکس، بولد، خط جداکننده) به صورت پیام ارسال می‌کند
+ */
+function gemini_deliver_reply($chat_id, $reply_text, $from_id) {
+    // پیدا کردن بلوک‌های کد داخل پاسخ
+    preg_match_all('/```([a-zA-Z0-9_+\-]*)\n?([\s\S]*?)```/', $reply_text, $matches, PREG_SET_ORDER);
+
+    $send_as_file = false;
+    $file_lang = '';
+    $file_code = '';
+
+    if (!empty($matches)) {
+        // بزرگ‌ترین بلوک کد را پیدا کن
+        $longest = '';
+        $longest_lang = '';
+        foreach ($matches as $m) {
+            if (mb_strlen($m[2]) > mb_strlen($longest)) {
+                $longest = $m[2];
+                $longest_lang = $m[1];
+            }
+        }
+        $code_lines = substr_count($longest, "\n") + 1;
+        // اگر کد طولانی بود (بیش از ۳۵ خط یا ۳۰۰۰ کاراکتر) یا کل پیام از سقف تلگرام رد می‌شود -> فایل بفرست
+        if ($code_lines > 35 || mb_strlen($longest) > 3000 || mb_strlen($reply_text) > 3800) {
+            $send_as_file = true;
+            $file_lang = $longest_lang;
+            $file_code = $longest;
+        }
+    }
+
+    if ($send_as_file) {
+        $ext = gemini_guess_file_extension($file_lang, $file_code);
+        $tmp_path = sys_get_temp_dir() . '/gemini_code_' . $from_id . '_' . time() . '.' . $ext;
+        file_put_contents($tmp_path, $file_code);
+
+        // متنی که خارج از بلوک کد اصلی نوشته شده را به‌عنوان توضیح/کپشن می‌فرستیم
+        $explanation = trim(str_replace($matches[0][0] ?? '', '', $reply_text));
+        if ($explanation === '') {
+            $explanation = "📄 کد/فایل شما آماده شد. می‌توانید آن را دانلود کنید.";
+        }
+        if (mb_strlen($explanation) > 900) {
+            $explanation = mb_substr($explanation, 0, 900) . "...";
+        }
+
+        global $token;
+        $send_url = "https://api.telegram.org/bot" . $token . "/sendDocument";
+        $post_fields = [
+            'chat_id' => $chat_id,
+            'caption' => mb_substr($explanation, 0, 1000),
+            'document' => new CURLFile($tmp_path, 'text/plain', basename($tmp_path))
+        ];
+        $ch = curl_init($send_url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $post_fields);
+        curl_exec($ch);
+        curl_close($ch);
+        @unlink($tmp_path);
+
+        // اگر متن توضیحات هم طولانی بود (بیشتر از کپشن جا داشت)، جداگانه با فرمت کامل بفرست
+        if (mb_strlen($explanation) > 1000) {
+            gemini_safe_send($chat_id, $explanation);
+        }
+    } else {
+        if (mb_strlen($reply_text) > 4000) {
+            $reply_text = mb_substr($reply_text, 0, 4000) . "...\n[ادامه متن به دلیل طولانی بودن بریده شد]";
+        }
+        gemini_safe_send($chat_id, $reply_text);
+    }
 }
 
 // 1. بررسی دکمه بازگشت به منوی اصلی
@@ -53,20 +258,20 @@ if ($text == $text_lang[$user_lang]['btn_gemini']) {
     $db->prepare("UPDATE users SET step = 'gemini_chat' WHERE user_id = ?")->execute([$from_id]);
 
     $back_btn = ($user_lang == 'en') ? '🔙 Back' : (($user_lang == 'ar') ? '🔙 عودة' : '🔙 بازگشت');
-    $msg = ($user_lang == 'en') ? "🧠 Welcome to Gemini.\nType your question, send a photo of the exam, or ask me to *draw* / *generate an image* of something:" :
-          (($user_lang == 'ar') ? "🧠 مرحباً بك في Gemini.\nاكتب سؤالك، أرسل صورة الامتحان، أو اطلب مني *رسم* / *إنشاء صورة*:" :
-          "🧠 به بخش هوش مصنوعی Gemini خوش آمدید.\nسوال درسی خود را تایپ کنید، عکس بفرستید، یا بگویید مثلاً «یک تصویر از ... بساز»:");
+    $msg = ($user_lang == 'en') ? "🧠 Welcome to Gemini.\nType your question, send a photo of the exam, send your *code* or *log file* for debugging, or ask me to *draw* / *generate an image* of something:" :
+          (($user_lang == 'ar') ? "🧠 مرحباً بك في Gemini.\nاكتب سؤالك، أرسل صورة الامتحان، أرسل *الكود* أو *ملف السجل* للمراجعة، أو اطلب مني *رسم* / *إنشاء صورة*:" :
+          "🧠 به بخش هوش مصنوعی Gemini خوش آمدید.\nسوال درسی خود را تایپ کنید، عکس بفرستید، کد یا فایل لاگ خود را برای بررسی و رفع باگ ارسال کنید، یا بگویید مثلاً «یک تصویر از ... بساز»:");
 
     bot('sendMessage', [
         'chat_id' => $chat_id,
-        'text' => $msg,
-        'parse_mode' => 'Markdown',
+        'text' => gemini_to_telegram_markdown($msg),
+        'parse_mode' => 'MarkdownV2',
         'reply_markup' => json_encode(['keyboard' => [[$back_btn]], 'resize_keyboard' => true])
     ]);
     exit;
 }
 
-// 3. پردازش پیام ارسالی (متن یا عکس) در وضعیت چت
+// 3. پردازش پیام ارسالی (متن یا عکس یا فایل) در وضعیت چت
 if ($user['step'] == 'gemini_chat') {
 
     // کلید API گوگل (توصیه می‌شود در صورت افشا شدن حتما تعویض شود)
@@ -87,10 +292,34 @@ if ($user['step'] == 'gemini_chat') {
     }
 
     // ---------------------------------------------------------------
+    // پشتیبانی از فایل آپلودی (سند) - مثلا فایل پایتون/لاگ که کاربر مستقیما به‌عنوان فایل فرستاده
+    // ---------------------------------------------------------------
+    $uploaded_file_content = null;
+    $uploaded_file_name = null;
+    if (isset($message->document)) {
+        $doc = $message->document;
+        $uploaded_file_name = $doc->file_name ?? 'file.txt';
+        $file_size = $doc->file_size ?? 0;
+
+        // فقط فایل‌های متنی/کد را می‌خوانیم (سقف ۲ مگابایت برای جلوگیری از مصرف زیاد حافظه)
+        if ($file_size > 0 && $file_size < 2 * 1024 * 1024) {
+            $file_info = bot('getFile', ['file_id' => $doc->file_id]);
+            $doc_file_path = $file_info->result->file_path ?? null;
+            if ($doc_file_path) {
+                $doc_url = "https://api.telegram.org/file/bot" . $token . "/" . $doc_file_path;
+                $raw_content = @file_get_contents($doc_url);
+                if ($raw_content !== false) {
+                    $uploaded_file_content = $raw_content;
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
     // تشخیص اینکه آیا کاربر درخواست «ساخت تصویر» دارد یا سوال معمولی
     // ---------------------------------------------------------------
     $is_image_request = false;
-    if (!empty($text) && !isset($message->photo)) {
+    if (!empty($text) && !isset($message->photo) && !$uploaded_file_content) {
         $image_keywords = [
             'بساز', 'طراحی کن', 'نقاشی کن', 'یک تصویر', 'تصویری از', 'عکس بساز', 'تصویر بساز',
             'draw', 'generate image', 'create image', 'create an image', 'make an image', 'an image of',
@@ -184,7 +413,7 @@ if ($user['step'] == 'gemini_chat') {
             $post_fields = [
                 'chat_id' => $chat_id,
                 'caption' => gemini_to_telegram_markdown($caption_text),
-                'parse_mode' => 'Markdown',
+                'parse_mode' => 'MarkdownV2',
                 'photo' => new CURLFile($tmp_path, 'image/png', 'image.png')
             ];
 
@@ -223,7 +452,7 @@ if ($user['step'] == 'gemini_chat') {
     }
 
     // =================================================================
-    // مسیر ب) حل سوال متنی / تصویری (مسیر قبلی پروژه)
+    // مسیر ب) حل سوال متنی / تصویری / بررسی کد و فایل (مسیر اصلی)
     // =================================================================
 
     $models = [
@@ -231,16 +460,48 @@ if ($user['step'] == 'gemini_chat') {
         'gemini-2.5-pro'
     ];
 
+    $wait_text = "⏳ در حال تحلیل و حل سوال... لطفاً چند ثانیه صبر کنید.";
+
+    // تشخیص اینکه ورودی شبیه کد/لاگ است تا پیام انتظار و پرامپت سیستم را عوض کنیم
+    $input_for_detection = $uploaded_file_content ?? $text;
+    $is_code_task = $input_for_detection ? gemini_looks_like_code_or_log($input_for_detection) : false;
+    if ($is_code_task || $uploaded_file_content) {
+        $wait_text = "🛠 در حال بررسی دقیق کد/لاگ شما (خط به خط)... لطفاً چند لحظه صبر کنید.";
+    }
+
     $wait_msg = bot('sendMessage', [
         'chat_id' => $chat_id,
-        'text' => "⏳ در حال تحلیل و حل سوال... لطفاً چند ثانیه صبر کنید."
+        'text' => $wait_text
     ]);
     $wait_msg_id = $wait_msg->result->message_id ?? null;
 
     $payload = [];
-    $system_instruction = "\nYou are a helpful tutor. Answer the user's question accurately. " .
-        "Use **double asterisks** around important terms/headings for bold emphasis where useful. " .
-        "IMPORTANT: You must reply entirely in this language code: " . $user_lang;
+
+    // پرامپت سیستم پایه (همیشه فعال)
+    $base_instruction = "\nYou are a helpful, friendly tutor and an expert senior software engineer. " .
+        "IMPORTANT: You must reply entirely in this language code: " . $user_lang . ". " .
+        "Formatting rules (very important, follow exactly): " .
+        "Use **double asterisks** around important terms/headings for bold emphasis. " .
+        "Use a line containing only --- to separate distinct sections when it improves readability. " .
+        "Whenever you show any code, command, file content, error message, or log output, you MUST wrap it in a fenced code block using triple backticks with the language name right after the opening backticks, e.g. ```python\\n...code...\\n```. Never show code outside of a code block.";
+
+    // پرامپت اضافه‌ی تخصصی برنامه‌نویسی، فقط زمانی که ورودی شبیه کد/لاگ/فایل بود
+    $code_instruction = "";
+    if ($is_code_task || $uploaded_file_content) {
+        $code_instruction = "\n\nThe user has sent code, a log file, or asked a programming question. " .
+            "Act as an extremely careful, senior-level code reviewer and debugger, similar to a top-tier AI coding assistant. " .
+            "Do the following precisely: " .
+            "1) Identify the programming language automatically. " .
+            "2) Read the ENTIRE code or log carefully, line by line — do not skim. " .
+            "3) Identify every bug, syntax error, logic error, security issue, or exception cause you find, citing the relevant line(s) or function names. " .
+            "4) If it's a log/traceback, explain exactly what failed and why, in plain language. " .
+            "5) Provide a corrected, complete, working version of the code in a single fenced code block with the correct language tag — not just a diff or snippet, unless the user only asked about one specific part. " .
+            "6) Briefly explain what you changed and why, using **bold** for key terms. " .
+            "7) If relevant, suggest best-practice improvements (performance, readability, security) after the main fix. " .
+            "Be thorough and precise — accuracy matters more than brevity for code tasks.";
+    }
+
+    $system_instruction = $base_instruction . $code_instruction;
 
     if (isset($message->photo)) {
         $photo_array = $message->photo;
@@ -275,6 +536,18 @@ if ($user['step'] == 'gemini_chat') {
             ]
         ];
     }
+    elseif ($uploaded_file_content !== null) {
+        // فایل کد/لاگ آپلودشده توسط کاربر
+        $user_caption = $message->caption ?? "این فایل را با دقت کامل بررسی کن، باگ‌ها/خطاها را پیدا کن و نسخه اصلاح‌شده را بده.";
+        $file_text_for_prompt = "نام فایل: " . ($uploaded_file_name ?? 'unknown') . "\n\n" .
+            "محتوای فایل:\n```\n" . $uploaded_file_content . "\n```\n\n" . $user_caption;
+
+        $payload = [
+            "contents" => [
+                ["parts" => [["text" => $file_text_for_prompt . $system_instruction]]]
+            ]
+        ];
+    }
     elseif (!empty($text)) {
         $payload = [
             "contents" => [
@@ -284,7 +557,7 @@ if ($user['step'] == 'gemini_chat') {
     }
     else {
         if ($wait_msg_id) bot('deleteMessage', ['chat_id' => $chat_id, 'message_id' => $wait_msg_id]);
-        bot('sendMessage', ['chat_id' => $chat_id, 'text' => "❌ فرمت پشتیبانی نمی‌شود. لطفاً فقط متن یا عکس بفرستید."]);
+        bot('sendMessage', ['chat_id' => $chat_id, 'text' => "❌ فرمت پشتیبانی نمی‌شود. لطفاً متن، عکس، یا فایل کد/لاگ ارسال کنید."]);
         exit;
     }
 
@@ -300,7 +573,7 @@ if ($user['step'] == 'gemini_chat') {
         curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
         curl_setopt($ch, CURLOPT_POST, true);
         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
-        curl_setopt($ch, CURLOPT_TIMEOUT, 40);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 50);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
         $response = curl_exec($ch);
         $curl_errno = curl_errno($ch);
@@ -330,11 +603,8 @@ if ($user['step'] == 'gemini_chat') {
     if ($wait_msg_id) bot('deleteMessage', ['chat_id' => $chat_id, 'message_id' => $wait_msg_id]);
 
     if ($success) {
-        if (mb_strlen($reply_text) > 4000) {
-            $reply_text = mb_substr($reply_text, 0, 4000) . "...\n[ادامه متن به دلیل طولانی بودن بریده شد]";
-        }
-
-        gemini_safe_send($chat_id, $reply_text);
+        // ارسال هوشمند: اگر کد سنگین بود به‌صورت فایل، در غیر اینصورت پیام فرمت‌شده با MarkdownV2
+        gemini_deliver_reply($chat_id, $reply_text, $from_id);
     } else {
         $error_details = "❌ سرورهای گوگل پاسخ موفق ندادند. جزئیات خطا برای دیباگ:\n\n";
 
