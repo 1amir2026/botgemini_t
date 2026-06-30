@@ -240,6 +240,37 @@ function gemini_deliver_reply($chat_id, $reply_text, $from_id) {
     }
 }
 
+// =================================================================
+// بخش ۲.۵: ادیت پیام انتظار به‌صورت دوره‌ای (نمایش "در حال انجام چه کاری" + درصد فیک)
+// تا کاربر در طول پردازش طولانی احساس کند ربات در حال کار است و صبرش بیشتر شود
+// =================================================================
+function gemini_edit_wait_progress(&$state, $steps_arr) {
+    if (empty($state['msg_id'])) return;
+
+    $now = microtime(true);
+    // حداقل فاصله بین دو ادیت پشت‌سرهم (برای جلوگیری از Rate Limit تلگرام)
+    if (($now - ($state['last_edit_time'] ?? 0)) < 2.5) return;
+
+    $state['last_edit_time'] = $now;
+
+    $step_text = $steps_arr[$state['step_index'] % count($steps_arr)];
+    $state['step_index']++;
+
+    // درصد فیک ولی منطقی: هر بار کمی بیشتر می‌شود ولی هیچ‌وقت به ۱۰۰ نمی‌رسد تا واقعی‌تر به‌نظر برسد
+    $state['percent'] = min(93, ($state['percent'] ?? 5) + rand(6, 13));
+
+    $progress_text = $state['base_text'] .
+        "\n\n<i>" . $step_text . "</i>" .
+        "\n<i>پیشرفت تقریبی: " . $state['percent'] . "٪</i>";
+
+    bot('editMessageText', [
+        'chat_id'    => $state['chat_id'],
+        'message_id' => $state['msg_id'],
+        'text'       => $progress_text,
+        'parse_mode' => 'HTML'
+    ]);
+}
+
 // 1. بررسی دکمه بازگشت به منوی اصلی
 if ($text == '🔙 بازگشت' || $text == '🔙 Back' || $text == '🔙 عودة') {
     $db->prepare("UPDATE users SET step = 'main_menu' WHERE user_id = ?")->execute([$from_id]);
@@ -478,6 +509,31 @@ if ($user['step'] == 'gemini_chat') {
     ]);
     $wait_msg_id = $wait_msg->result->message_id ?? null;
 
+    // وضعیت‌های نمایشی که هر چند لحظه یک‌بار (حین درخواست به Gemini) جایگزین هم می‌شوند
+    $gemini_progress_steps = $is_code_task || $uploaded_file_content
+        ? [
+            "در حال خواندن خط به خط کد/لاگ شما...",
+            "در حال شناسایی باگ‌ها و خطاهای احتمالی...",
+            "در حال بررسی منطق و ساختار کد...",
+            "در حال آماده‌سازی نسخه اصلاح‌شده...",
+            "کمی پیچیده است، لطفاً چند لحظه دیگر صبر کنید...",
+        ]
+        : [
+            "در حال خواندن و تحلیل دقیق سوال شما...",
+            "در حال بررسی زمینه و جزئیات موضوع...",
+            "در حال جست‌وجو برای بهترین پاسخ ممکن...",
+            "در حال بررسی صحت و دقت پاسخ...",
+            "در حال آماده‌سازی و فرمت‌بندی پاسخ نهایی...",
+        ];
+    $gemini_progress_state = [
+        'msg_id'         => $wait_msg_id,
+        'chat_id'        => $chat_id,
+        'base_text'      => $wait_text,
+        'step_index'     => 0,
+        'percent'        => 5,
+        'last_edit_time' => 0,
+    ];
+
     $payload = [];
 
     // پرامپت سیستم پایه (همیشه فعال)
@@ -569,6 +625,9 @@ if ($user['step'] == 'gemini_chat') {
     $debug_log = [];
 
     foreach ($models as $current_model) {
+        // هر بار که مدل عوض می‌شود (تلاش مجدد)، یک‌بار هم پیام انتظار را به‌روزرسانی کن
+        gemini_edit_wait_progress($gemini_progress_state, $gemini_progress_steps);
+
         $api_url = "https://generativelanguage.googleapis.com/v1beta/models/" . $current_model . ":generateContent?key=" . $gemini_api_key;
 
         $ch = curl_init($api_url);
@@ -578,6 +637,11 @@ if ($user['step'] == 'gemini_chat') {
         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
         curl_setopt($ch, CURLOPT_TIMEOUT, 50);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        // فعال‌سازی progress callback تا حین انتظار برای پاسخ Gemini، پیام کاربر هر چند ثانیه ادیت شود
+        curl_setopt($ch, CURLOPT_NOPROGRESS, false);
+        curl_setopt($ch, CURLOPT_PROGRESSFUNCTION, function ($resource, $download_size, $downloaded, $upload_size, $uploaded) use (&$gemini_progress_state, $gemini_progress_steps) {
+            gemini_edit_wait_progress($gemini_progress_state, $gemini_progress_steps);
+        });
         $response = curl_exec($ch);
         $curl_errno = curl_errno($ch);
         $curl_error = curl_error($ch);
