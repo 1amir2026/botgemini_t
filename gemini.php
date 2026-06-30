@@ -43,6 +43,19 @@ if ($user['step'] == 'gemini_chat') {
     if (!$gemini_api_key) {
         die('GEMINI_API_KEY not found in Railway Variables');
     }
+
+    // بررسی فرمت کلید: کلیدهای استاندارد Gemini (از Google AI Studio) با "AIza" شروع می‌شوند.
+    // اگر کلید با چیز دیگری شروع شود (مثل AQ...)، احتمالاً کلید اشتباه/ناقص کپی شده یا از منبع دیگری (مثل Vertex AI / OAuth) است
+    // که با این endpoint (Generative Language API) کار نمی‌کند.
+    if (strpos($gemini_api_key, 'AIza') !== 0) {
+        error_log("[GEMINI WARNING] API key does not start with 'AIza'. Key prefix: " . substr($gemini_api_key, 0, 6));
+        bot('sendMessage', [
+            'chat_id' => $chat_id,
+            'text' => "⚠️ هشدار: کلید API شما با 'AIza' شروع نمی‌شود (شروع فعلی: " . substr($gemini_api_key, 0, 6) . "...).\n" .
+                      "کلیدهای استاندارد Gemini از Google AI Studio (https://aistudio.google.com/apikey) باید با AIza شروع شوند.\n" .
+                      "احتمالاً کلید شما ناقص کپی شده یا از منبع اشتباهی گرفته شده. با این حال تلاش برای اتصال ادامه می‌یابد..."
+        ]);
+    }
     
     // لیست مدل‌ها به ترتیب اولویت برای سیستم Fallback
     $models = [
@@ -120,6 +133,7 @@ if ($user['step'] == 'gemini_chat') {
     // 4. حلقه سوئیچ خودکار بین مدل‌ها (Fallback System)
     $success = false;
     $reply_text = '';
+    $debug_log = []; // برای ثبت کامل جزئیات هر تلاش
 
     foreach ($models as $current_model) {
         $api_url = "https://generativelanguage.googleapis.com/v1beta/models/" . $current_model . ":generateContent?key=" . $gemini_api_key;
@@ -129,12 +143,27 @@ if ($user['step'] == 'gemini_chat') {
         curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
         curl_setopt($ch, CURLOPT_POST, true);
         curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
-        curl_setopt($ch, CURLOPT_TIMEOUT, 40); 
+        curl_setopt($ch, CURLOPT_TIMEOUT, 40);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
         $response = curl_exec($ch);
+        $curl_errno = curl_errno($ch);
+        $curl_error = curl_error($ch);
         $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
         $result = json_decode($response, true);
+
+        // ثبت کامل جزئیات این تلاش برای دیباگ
+        $debug_log[] = [
+            'model'        => $current_model,
+            'http_code'    => $http_code,
+            'curl_errno'   => $curl_errno,
+            'curl_error'   => $curl_error,
+            'raw_response' => $response,
+        ];
+
+        // لاگ کردن در فایل لاگ سرور (در Railway در بخش Logs قابل مشاهده است)
+        error_log("[GEMINI DEBUG] model={$current_model} http_code={$http_code} curl_errno={$curl_errno} curl_error={$curl_error} response=" . substr((string)$response, 0, 2000));
 
         // بررسی اینکه آیا مدل فعلی با موفقیت پاسخ داده است؟
         if ($http_code == 200 && isset($result['candidates'][0]['content']['parts'][0]['text'])) {
@@ -168,10 +197,39 @@ if ($user['step'] == 'gemini_chat') {
             ]);
         }
     } else {
-        // اگر تمام مدل‌های تعریف شده با خطا مواجه شدند
+        // اگر تمام مدل‌های تعریف شده با خطا مواجه شدند، جزئیات دقیق هر تلاش را برای دیباگ نمایش بده
+        $error_details = "❌ سرورهای گوگل پاسخ موفق ندادند. جزئیات خطا برای دیباگ:\n\n";
+
+        foreach ($debug_log as $attempt) {
+            $error_details .= "🔹 مدل: " . $attempt['model'] . "\n";
+            $error_details .= "HTTP Code: " . $attempt['http_code'] . "\n";
+
+            if ($attempt['curl_errno'] != 0) {
+                $error_details .= "خطای cURL (" . $attempt['curl_errno'] . "): " . $attempt['curl_error'] . "\n";
+            }
+
+            // تلاش برای استخراج پیام خطای دقیق گوگل از پاسخ JSON
+            $decoded = json_decode($attempt['raw_response'], true);
+            if (isset($decoded['error']['message'])) {
+                $error_details .= "پیام گوگل: " . $decoded['error']['message'] . "\n";
+                if (isset($decoded['error']['status'])) {
+                    $error_details .= "وضعیت: " . $decoded['error']['status'] . "\n";
+                }
+            } else {
+                // اگر پاسخ JSON معتبر نبود، خام آن را (محدود) نشان بده
+                $error_details .= "پاسخ خام: " . mb_substr((string)$attempt['raw_response'], 0, 300) . "\n";
+            }
+            $error_details .= "—\n";
+        }
+
+        // محدود کردن طول پیام برای جلوگیری از خطای تلگرام
+        if (mb_strlen($error_details) > 4000) {
+            $error_details = mb_substr($error_details, 0, 4000) . "...";
+        }
+
         bot('sendMessage', [
             'chat_id' => $chat_id,
-            'text' => "❌ متأسفانه سرورهای هوش مصنوعی گوگل در حال حاضر پاسخگو نیستند یا عکس ارسالی خوانا نیست. لطفاً دقایقی دیگر مجدداً تلاش کنید."
+            'text' => $error_details
         ]);
     }
 }
